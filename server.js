@@ -77,21 +77,21 @@ wss.on('connection', (ws) => {
 
         if (!entry) {
           ws.send(JSON.stringify({ status: 'invalid_pair' }));
-          ws.close();
+          ws.close(1008, 'Invalid Pair ID');
           return;
         }
 
         if (entry.token !== data.token) {
           console.warn(`❌ Token mismatch for pair ${data.pairId}`);
           ws.send(JSON.stringify({ status: 'unauthorized' }));
-          ws.close();
+          ws.close(1008, 'Unauthorized Token');
           return;
         }
 
         if (entry[data.role]) {
           console.warn(`⚠️ Duplicate role "${data.role}" in pair ${data.pairId}`);
           ws.send(JSON.stringify({ status: 'role_taken' }));
-          ws.close();
+          ws.close(1008, 'Duplicate Role');
           return;
         }
 
@@ -118,10 +118,12 @@ wss.on('connection', (ws) => {
       }
     } catch (err) {
       console.error("❌ JSON parse error:", err.message);
+      ws.close(1008, 'Invalid JSON');
     }
   });
 
-  ws.on('close', () => {
+  ws.on('close', (code, reason) => {
+    console.log(`🔌 Socket closed (code=${code}, reason="${reason}")`);
     if (pairId && role) {
       const entry = pairs.get(pairId);
       if (entry) {
@@ -132,6 +134,10 @@ wss.on('connection', (ws) => {
         }
       }
     }
+  });
+
+  ws.on('error', (err) => {
+    console.error("⚠️ WebSocket error:", err.message);
   });
 });
 
