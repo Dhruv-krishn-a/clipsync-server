@@ -1,52 +1,22 @@
 const WebSocket = require('ws');
-const { spawn } = require('child_process');
-const os = require('os');
-const qrcode = require('qrcode-terminal');
+const http = require('http');
 
-const PORT = 5050;
+// Render gives you a dynamic port via environment variable
+const PORT = process.env.PORT || 5050;
+
+// Generate a temporary key for verification
 const KEY = Math.floor(100000 + Math.random() * 900000).toString();
 
-// Simplified function for Arch Linux (checks for Wayland/X11)
-const getCopyCommand = () => {
-  if (process.env.WAYLAND_DISPLAY) {
-    console.log("💡 Wayland session detected. Using 'wl-copy'.");
-    return { cmd: 'wl-copy', args: [] };
-  } else {
-    console.log("💡 X11 session detected. Using 'xclip'.");
-    return { cmd: 'xclip', args: ['-selection', 'clipboard'] };
-  }
-};
+console.log(`🔐 Pairing Key: ${KEY}`);
 
-const copyCommand = getCopyCommand();
+const server = http.createServer(); // needed for Render's WebSocket proxy
+const wss = new WebSocket.Server({ server });
 
-const getLocalIP = () => {
-  const interfaces = os.networkInterfaces();
-  for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name]) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address;
-      }
-    }
-  }
-  return '127.0.0.1'; // Fallback
-};
-
-const ip = getLocalIP();
-
-console.log(`\n📲 ClipSync Server for Arch Linux`);
-console.log(`===================================`);
-console.log(`📡 Server running at ws://${ip}:${PORT}`);
-console.log(`🔐 Pairing Key: ${KEY}\n`);
-
-// Display QR code with all connection info
-const qrData = JSON.stringify({ ip, port: PORT, key: KEY });
-console.log("Scan this QR code with the mobile app to connect automatically:");
-qrcode.generate(qrData, { small: true });
-
-const wss = new WebSocket.Server({ port: PORT });
+console.log("🚀 WebSocket server starting...");
 
 wss.on('connection', (ws) => {
-  console.log("\n🔗 Mobile client connection request received.");
+  console.log("🔗 Client connected");
+
   let verified = false;
 
   const verificationTimeout = setTimeout(() => {
@@ -60,7 +30,6 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(message);
 
-      // 1. Handle Verification
       if (!verified && data.key === KEY) {
         verified = true;
         clearTimeout(verificationTimeout);
@@ -74,24 +43,12 @@ wss.on('connection', (ws) => {
         ws.close();
         return;
       }
-      
-      // 2. Handle Clipboard Data
-      if (data.text) {
-        const text = data.text;
-        console.log(`[📋 Received]: ${text.substring(0, 70)}...`);
-        
-        const copy = spawn(copyCommand.cmd, copyCommand.args);
-        copy.stdin.write(text);
-        copy.stdin.end();
 
-        copy.on('exit', () => {
-          console.log("📎 Copied to system clipboard.");
-        });
-        copy.on('error', (err) => {
-          console.error(`❌ Failed to run clipboard command. Make sure '${copyCommand.cmd}' is installed.`);
-          console.error(err.message);
-        });
+      if (data.text) {
+        console.log(`[📋 Received]: ${data.text.substring(0, 70)}...`);
+        // Cloud version doesn't support clipboard — desktop client will do that
       }
+
     } catch (err) {
       console.error("❌ Failed to process message:", err.message);
     }
@@ -99,6 +56,10 @@ wss.on('connection', (ws) => {
 
   ws.on('close', () => {
     clearTimeout(verificationTimeout);
-    console.log("🔌 Mobile client disconnected.");
+    console.log("🔌 Client disconnected.");
   });
+});
+
+server.listen(PORT, () => {
+  console.log(`✅ Server listening on port ${PORT}`);
 });
