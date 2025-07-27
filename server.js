@@ -1,62 +1,114 @@
-const WebSocket = require('ws');
 const http = require('http');
+const WebSocket = require('ws');
+const crypto = require('crypto');
+const url = require('url');
 
-// Render gives you a dynamic port via environment variable
 const PORT = process.env.PORT || 5050;
+const server = http.createServer();
+const wss = new WebSocket.Server({ noServer: true });
 
-// Generate a temporary key for verification
-const KEY = Math.floor(100000 + Math.random() * 900000).toString();
+console.log("🚀 ClipSync Server starting...");
 
-console.log(`🔐 Pairing Key: ${KEY}`);
+const pairings = new Map(); // key -> [ws1, ws2]
+const pending = new Map(); // ws -> key
 
-const server = http.createServer(); // needed for Render's WebSocket proxy
-const wss = new WebSocket.Server({ server });
+function generateKey() {
+  return Math.floor(100000 + Math.random() * 900000).toString();
+}
 
-console.log("🚀 WebSocket server starting...");
+server.on('request', (req, res) => {
+  const { method, url: path } = req;
+
+  // Generate a pairing key
+  if (method === 'GET' && path === '/pair') {
+    const key = generateKey();
+    pairings.set(key, []);
+    console.log("🔐 New pairing key generated:", key);
+
+    // Expire key after 2 minutes
+    setTimeout(() => {
+      if (pairings.get(key)?.length === 0) {
+        console.log("⏰ Pairing key expired:", key);
+        pairings.delete(key);
+      }
+    }, 2 * 60 * 1000);
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ key }));
+    return;
+  }
+
+  // Not found
+  res.writeHead(404);
+  res.end('Not found');
+});
+
+// Handle WebSocket upgrades
+server.on('upgrade', (req, socket, head) => {
+  const { pathname } = url.parse(req.url);
+
+  if (pathname === '/') {
+    wss.handleUpgrade(req, socket, head, (ws) => {
+      wss.emit('connection', ws, req);
+    });
+  } else {
+    socket.destroy();
+  }
+});
 
 wss.on('connection', (ws) => {
-  console.log("🔗 Client connected");
+  console.log("🔗 WebSocket client connected");
 
-  let verified = false;
+  let pairedKey = null;
 
-  const verificationTimeout = setTimeout(() => {
-    if (!verified) {
-      console.log("⏰ Verification timed out. Disconnecting client.");
-      ws.close();
-    }
-  }, 5000);
-
-  ws.on('message', (message) => {
+  ws.on('message', (msg) => {
     try {
-      const data = JSON.parse(message);
+      const data = JSON.parse(msg);
 
-      if (!verified && data.key === KEY) {
-        verified = true;
-        clearTimeout(verificationTimeout);
-        console.log("✅ Client verified successfully.");
-        ws.send(JSON.stringify({ status: 'verified' }));
+      // Step 1: Pair using key
+      if (data.key && !pairedKey) {
+        const list = pairings.get(data.key);
+        if (list && list.length < 2) {
+          list.push(ws);
+          pending.set(ws, data.key);
+          pairedKey = data.key;
+          ws.send(JSON.stringify({ status: 'verified' }));
+          console.log("✅ Client verified with key:", data.key);
+
+          if (list.length === 2) {
+            console.log("🔗 Pair complete. Two clients connected for key:", data.key);
+          }
+        } else {
+          ws.send(JSON.stringify({ status: 'unauthorized' }));
+          ws.close();
+        }
         return;
       }
 
-      if (!verified) {
-        ws.send(JSON.stringify({ status: 'unauthorized' }));
-        ws.close();
-        return;
+      // Step 2: Relay clipboard
+      if (pairedKey && data.text) {
+        const others = pairings.get(pairedKey)?.filter(c => c !== ws && c.readyState === WebSocket.OPEN);
+        if (others) {
+          for (const client of others) {
+            client.send(JSON.stringify({ text: data.text }));
+          }
+        }
       }
-
-      if (data.text) {
-        console.log(`[📋 Received]: ${data.text.substring(0, 70)}...`);
-        // Cloud version doesn't support clipboard — desktop client will do that
-      }
-
     } catch (err) {
-      console.error("❌ Failed to process message:", err.message);
+      console.error("❌ Error handling message:", err.message);
     }
   });
 
   ws.on('close', () => {
-    clearTimeout(verificationTimeout);
-    console.log("🔌 Client disconnected.");
+    const key = pending.get(ws);
+    if (key) {
+      const group = pairings.get(key);
+      if (group) {
+        pairings.set(key, group.filter(c => c !== ws));
+      }
+      pending.delete(ws);
+      console.log("🔌 WebSocket closed. Key:", key);
+    }
   });
 });
 
