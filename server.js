@@ -26,7 +26,7 @@ server.on('request', (req, res) => {
     const token = generateToken();
     pairs.set(pairId, { token, pc: null, app: null });
 
-    // Expire if unused after 2 minutes
+    // Expire unused pairs
     setTimeout(() => {
       const p = pairs.get(pairId);
       if (p && (!p.pc || !p.app)) {
@@ -72,7 +72,6 @@ wss.on('connection', (ws) => {
       // Step 1: Initial identification
       if (!pairId && data.pairId && data.role && data.token) {
         const entry = pairs.get(data.pairId);
-
         console.log(`🔐 Incoming [${data.role}] for ${data.pairId}...`);
 
         if (!entry) {
@@ -88,14 +87,17 @@ wss.on('connection', (ws) => {
           return;
         }
 
+        // ✅ Replace existing role connection
         if (entry[data.role]) {
-          console.warn(`⚠️ Duplicate role "${data.role}" in pair ${data.pairId}`);
-          ws.send(JSON.stringify({ status: 'role_taken' }));
-          ws.close(1008, 'Duplicate Role');
-          return;
+          console.warn(`🔁 Replacing old ${data.role} in pair ${data.pairId}`);
+          try {
+            entry[data.role].close(4000, 'Replaced by new device');
+          } catch (err) {
+            console.error(`⚠️ Could not close old ${data.role}:`, err.message);
+          }
         }
 
-        // Accept connection
+        // Accept new connection
         entry[data.role] = ws;
         pairId = data.pairId;
         role = data.role;
@@ -116,6 +118,7 @@ wss.on('connection', (ws) => {
           console.log("⚠️ No paired device connected.");
         }
       }
+
     } catch (err) {
       console.error("❌ JSON parse error:", err.message);
       ws.close(1008, 'Invalid JSON');
@@ -124,12 +127,13 @@ wss.on('connection', (ws) => {
 
   ws.on('close', (code, reason) => {
     console.log(`🔌 Socket closed (code=${code}, reason="${reason}")`);
+
     if (pairId && role) {
       const entry = pairs.get(pairId);
       if (entry) {
         entry[role] = null;
 
-        // Notify other peer about the disconnect
+        // Notify other peer
         const otherRole = role === 'pc' ? 'app' : 'pc';
         const otherSocket = entry[otherRole];
         if (otherSocket && otherSocket.readyState === WebSocket.OPEN) {
