@@ -4,38 +4,40 @@ const { randomBytes } = require('crypto');
 const url = require('url');
 
 const PORT = process.env.PORT || 5050;
-
 const server = http.createServer();
 const wss = new WebSocket.Server({ noServer: true });
 
-const pairs = new Map(); // pairId → { pc: ws, app: ws }
+const pairs = new Map(); // pairId -> { token, pc: ws, app: ws }
 
 function generatePairId() {
-  return randomBytes(3).toString('hex'); // e.g., "a7b9c2"
+  return randomBytes(3).toString('hex'); // e.g., '43f2f2'
 }
 
-// -------------------------
-// HTTP Endpoint for /pair
-// -------------------------
+function generateToken() {
+  return randomBytes(16).toString('hex'); // one-time secret token
+}
+
+// ---------------------------
+// HTTP Endpoint: /pair
+// ---------------------------
 server.on('request', (req, res) => {
-  const { method, url: path } = req;
-
-  if (method === 'POST' && path === '/pair') {
+  if (req.method === 'POST' && req.url === '/pair') {
     const pairId = generatePairId();
-    pairs.set(pairId, { pc: null, app: null });
+    const token = generateToken();
+    pairs.set(pairId, { token, pc: null, app: null });
 
-    // Auto-expire after 2 mins if not connected
+    // Expire if unused after 2 minutes
     setTimeout(() => {
-      const entry = pairs.get(pairId);
-      if (entry && (!entry.pc || !entry.app)) {
-        console.log(`⏰ Expiring unused pairId: ${pairId}`);
+      const p = pairs.get(pairId);
+      if (p && (!p.pc || !p.app)) {
+        console.log(`⏰ Expired unused pair: ${pairId}`);
         pairs.delete(pairId);
       }
     }, 2 * 60 * 1000);
 
+    console.log(`🔐 New Pair: ${pairId} [token: ${token.slice(0, 8)}...]`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ pairId }));
-    console.log(`🔐 New pairId generated: ${pairId}`);
+    res.end(JSON.stringify({ pairId, token }));
     return;
   }
 
@@ -43,12 +45,11 @@ server.on('request', (req, res) => {
   res.end('Not Found');
 });
 
-// -------------------------
-// WebSocket Handling
-// -------------------------
+// ---------------------------
+// WebSocket Upgrade Handling
+// ---------------------------
 server.on('upgrade', (req, socket, head) => {
   const { pathname } = url.parse(req.url);
-
   if (pathname === '/') {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit('connection', ws, req);
@@ -59,8 +60,8 @@ server.on('upgrade', (req, socket, head) => {
 });
 
 wss.on('connection', (ws) => {
-  let pairedId = null;
-  let role = null; // 'pc' or 'app'
+  let pairId = null;
+  let role = null;
 
   console.log("🔗 New WebSocket connection");
 
@@ -68,55 +69,66 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(msg);
 
-      // First message must be: { pairId, role: 'pc' | 'app' }
-      if (!pairedId && data.pairId && (data.role === 'pc' || data.role === 'app')) {
+      // Step 1: Initial identification { pairId, token, role: 'pc' | 'app' }
+      if (!pairId && data.pairId && data.role && data.token) {
         const entry = pairs.get(data.pairId);
+
+        console.log(`🔐 Incoming [${data.role}] for ${data.pairId}...`);
+
         if (!entry) {
           ws.send(JSON.stringify({ status: 'invalid_pair' }));
           ws.close();
           return;
         }
 
+        if (entry.token !== data.token) {
+          console.warn(`❌ Token mismatch for pair ${data.pairId}`);
+          ws.send(JSON.stringify({ status: 'unauthorized' }));
+          ws.close();
+          return;
+        }
+
         if (entry[data.role]) {
+          console.warn(`⚠️ Duplicate role "${data.role}" in pair ${data.pairId}`);
           ws.send(JSON.stringify({ status: 'role_taken' }));
           ws.close();
           return;
         }
 
+        // Accept connection
         entry[data.role] = ws;
-        pairedId = data.pairId;
+        pairId = data.pairId;
         role = data.role;
-
-        ws.send(JSON.stringify({ status: 'verified', pairId: pairedId }));
-        console.log(`✅ ${role.toUpperCase()} verified for pairId: ${pairedId}`);
+        ws.send(JSON.stringify({ status: 'verified', pairId }));
+        console.log(`✅ ${role.toUpperCase()} verified for ${pairId}`);
         return;
       }
 
-      // Relay clipboard text to the other peer
-      if (pairedId && data.text) {
-        const entry = pairs.get(pairedId);
+      // Step 2: Relay text between paired devices
+      if (pairId && data.text) {
+        const entry = pairs.get(pairId);
         const target = role === 'pc' ? entry.app : entry.pc;
 
         if (target && target.readyState === WebSocket.OPEN) {
           target.send(JSON.stringify({ text: data.text }));
-          console.log(`📤 Routed clipboard from ${role} → ${role === 'pc' ? 'app' : 'pc'}`);
+          console.log(`📤 Routed clipboard ${role} → ${role === 'pc' ? 'app' : 'pc'}`);
         } else {
-          console.log("⚠️ Paired client not connected.");
+          console.log("⚠️ No paired device connected.");
         }
       }
     } catch (err) {
-      console.error("❌ Message error:", err.message);
+      console.error("❌ JSON parse error:", err.message);
     }
   });
 
   ws.on('close', () => {
-    if (pairedId && role) {
-      const entry = pairs.get(pairedId);
+    if (pairId && role) {
+      const entry = pairs.get(pairId);
       if (entry) {
         entry[role] = null;
         if (!entry.pc && !entry.app) {
-          pairs.delete(pairedId);
-          console.log(`🗑️ Cleaned up pairId: ${pairedId}`);
+          pairs.delete(pairId);
+          console.log(`🗑️ Cleaned up pair: ${pairId}`);
         }
       }
     }
@@ -124,5 +136,5 @@ wss.on('connection', (ws) => {
 });
 
 server.listen(PORT, () => {
-  console.log(`✅ ClipSync Multi-User Server running on port ${PORT}`);
+  console.log(`✅ ClipSync Secure Server running on port ${PORT}`);
 });
