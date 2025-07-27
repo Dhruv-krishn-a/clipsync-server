@@ -69,7 +69,7 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(msg);
 
-      // Step 1: Initial identification { pairId, token, role: 'pc' | 'app' }
+      // Step 1: Initial identification
       if (!pairId && data.pairId && data.role && data.token) {
         const entry = pairs.get(data.pairId);
 
@@ -104,7 +104,7 @@ wss.on('connection', (ws) => {
         return;
       }
 
-      // Step 2: Relay text between paired devices
+      // Step 2: Relay clipboard
       if (pairId && data.text) {
         const entry = pairs.get(pairId);
         const target = role === 'pc' ? entry.app : entry.pc;
@@ -128,9 +128,19 @@ wss.on('connection', (ws) => {
       const entry = pairs.get(pairId);
       if (entry) {
         entry[role] = null;
+
+        // Notify other peer about the disconnect
+        const otherRole = role === 'pc' ? 'app' : 'pc';
+        const otherSocket = entry[otherRole];
+        if (otherSocket && otherSocket.readyState === WebSocket.OPEN) {
+          otherSocket.send(JSON.stringify({ status: `${role}_disconnected` }));
+        }
+
         if (!entry.pc && !entry.app) {
           pairs.delete(pairId);
           console.log(`🗑️ Cleaned up pair: ${pairId}`);
+        } else {
+          console.log(`📴 ${role.toUpperCase()} disconnected from ${pairId}`);
         }
       }
     }
