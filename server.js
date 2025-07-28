@@ -7,39 +7,33 @@ const PORT = process.env.PORT || 5050;
 const server = http.createServer();
 const wss = new WebSocket.Server({ noServer: true });
 
-const pairs = new Map(); // pairId -> { token, pc: ws, app: ws }
+const pairs = new Map(); // pairId -> { token, pc: ws, app: ws, deviceName }
 
 function generatePairId() {
-  return randomBytes(3).toString('hex'); // e.g., '43f2f2'
+  return randomBytes(3).toString('hex');
 }
 
 function generateToken() {
-  return randomBytes(16).toString('hex'); // one-time secret token
+  return randomBytes(16).toString('hex');
 }
 
-// ---------------------------
-// HTTP Endpoint: /pair
-// ---------------------------
+// --- HTTP: /pair ---
 server.on('request', (req, res) => {
   if (req.method === 'POST' && req.url === '/pair') {
     const pairId = generatePairId();
     const token = generateToken();
-    pairs.set(pairId, { token, pc: null, app: null });
+    pairs.set(pairId, { token, pc: null, app: null, deviceName: null });
 
-    // Expire unused pairs with notification to pc 
     setTimeout(() => {
       const p = pairs.get(pairId);
       if (p && (!p.pc || !p.app)) {
         console.log(`⏰ Expired unused pair: ${pairId}`);
-    
-        // ✅ Notify PC that the pair expired
         if (p.pc && p.pc.readyState === WebSocket.OPEN) {
           p.pc.send(JSON.stringify({ status: 'expired' }));
         }
-    
         pairs.delete(pairId);
       }
-    }, 2 * 60 * 1000); // 2 minutes
+    }, 2 * 60 * 1000);
 
     console.log(`🔐 New Pair: ${pairId} [token: ${token.slice(0, 8)}...]`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -51,9 +45,7 @@ server.on('request', (req, res) => {
   res.end('Not Found');
 });
 
-// ---------------------------
-// WebSocket Upgrade Handling
-// ---------------------------
+// --- WebSocket Upgrade ---
 server.on('upgrade', (req, socket, head) => {
   const { pathname } = url.parse(req.url);
   if (pathname === '/') {
@@ -65,6 +57,7 @@ server.on('upgrade', (req, socket, head) => {
   }
 });
 
+// --- WebSocket Handling ---
 wss.on('connection', (ws) => {
   let pairId = null;
   let role = null;
@@ -75,7 +68,7 @@ wss.on('connection', (ws) => {
     try {
       const data = JSON.parse(msg);
 
-      // Step 1: Initial identification
+      // Step 1: Authentication
       if (!pairId && data.pairId && data.role && data.token) {
         const entry = pairs.get(data.pairId);
         console.log(`🔐 Incoming [${data.role}] for ${data.pairId}...`);
@@ -87,15 +80,13 @@ wss.on('connection', (ws) => {
         }
 
         if (entry.token !== data.token) {
-          console.warn(`❌ Token mismatch for pair ${data.pairId}`);
           ws.send(JSON.stringify({ status: 'unauthorized' }));
           ws.close(1008, 'Unauthorized Token');
           return;
         }
 
-        // ✅ Replace existing role connection
+        // Replace any existing connection for this role
         if (entry[data.role]) {
-          console.warn(`🔁 Replacing old ${data.role} in pair ${data.pairId}`);
           try {
             entry[data.role].close(4000, 'Replaced by new device');
           } catch (err) {
@@ -103,11 +94,16 @@ wss.on('connection', (ws) => {
           }
         }
 
-        // Accept new connection
         entry[data.role] = ws;
+
+        if (data.role === 'app' && data.deviceName) {
+          entry.deviceName = data.deviceName;
+        }
+
         pairId = data.pairId;
         role = data.role;
-        ws.send(JSON.stringify({ status: 'verified', role: data.role, pairId }));
+
+        ws.send(JSON.stringify({ status: 'verified', pairId, role }));
         console.log(`✅ ${role.toUpperCase()} verified for ${pairId}`);
         return;
       }
@@ -118,13 +114,17 @@ wss.on('connection', (ws) => {
         const target = role === 'pc' ? entry.app : entry.pc;
 
         if (target && target.readyState === WebSocket.OPEN) {
-          target.send(JSON.stringify({ text: data.text }));
-          console.log(`📤 Routed clipboard ${role} → ${role === 'pc' ? 'app' : 'pc'}`);
+          target.send(
+            JSON.stringify({
+              text: data.text,
+              deviceName: entry.deviceName || 'Unknown Device',
+            })
+          );
+          console.log(`📤 Clipboard routed ${role} → ${role === 'pc' ? 'app' : 'pc'}`);
         } else {
-          console.log("⚠️ No paired device connected.");
+          console.log("⚠️ No paired device to send clipboard.");
         }
       }
-
     } catch (err) {
       console.error("❌ JSON parse error:", err.message);
       ws.close(1008, 'Invalid JSON');
@@ -139,11 +139,9 @@ wss.on('connection', (ws) => {
       if (entry) {
         entry[role] = null;
 
-        // Notify other peer
-        const otherRole = role === 'pc' ? 'app' : 'pc';
-        const otherSocket = entry[otherRole];
-        if (otherSocket && otherSocket.readyState === WebSocket.OPEN) {
-          otherSocket.send(JSON.stringify({ status: `${role}_disconnected` }));
+        const other = role === 'pc' ? entry.app : entry.pc;
+        if (other && other.readyState === WebSocket.OPEN) {
+          other.send(JSON.stringify({ status: `${role}_disconnected` }));
         }
 
         if (!entry.pc && !entry.app) {
