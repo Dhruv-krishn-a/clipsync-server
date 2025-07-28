@@ -26,14 +26,20 @@ server.on('request', (req, res) => {
     const token = generateToken();
     pairs.set(pairId, { token, pc: null, app: null });
 
-    // Expire unused pairs
+    // Expire unused pairs with notification to pc 
     setTimeout(() => {
       const p = pairs.get(pairId);
       if (p && (!p.pc || !p.app)) {
         console.log(`⏰ Expired unused pair: ${pairId}`);
+    
+        // ✅ Notify PC that the pair expired
+        if (p.pc && p.pc.readyState === WebSocket.OPEN) {
+          p.pc.send(JSON.stringify({ status: 'expired' }));
+        }
+    
         pairs.delete(pairId);
       }
-    }, 2 * 60 * 1000);
+    }, 2 * 60 * 1000); // 2 minutes
 
     console.log(`🔐 New Pair: ${pairId} [token: ${token.slice(0, 8)}...]`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
