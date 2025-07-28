@@ -107,7 +107,7 @@ wss.on('connection', (ws) => {
         entry[data.role] = ws;
         pairId = data.pairId;
         role = data.role;
-        ws.send(JSON.stringify({ status: 'verified', pairId }));
+        ws.send(JSON.stringify({ status: 'verified', role: data.role, pairId }));
         console.log(`✅ ${role.toUpperCase()} verified for ${pairId}`);
         return;
       }
