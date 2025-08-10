@@ -1,186 +1,161 @@
-const http = require('http');
-const WebSocket = require('ws');
-const { randomBytes } = require('crypto');
-const url = require('url');
+// server.js
+const http = require("http");
+const WebSocket = require("ws");
+const { randomBytes } = require("crypto");
+const url = require("url");
 
 const PORT = process.env.PORT || 5050;
 const server = http.createServer();
 const wss = new WebSocket.Server({ noServer: true });
 
-const pairs = new Map(); // pairId -> { token, pc, app, deviceName, timeout }
+// Stores all active pairs: pairId -> { token, pc, app }
+const pairs = new Map();
 
+/**
+ * Generate a random pairing ID (6 hex characters)
+ */
 function generatePairId() {
-  return randomBytes(3).toString('hex');
+  return randomBytes(3).toString("hex");
 }
 
+/**
+ * Generate a secure token for authentication
+ */
 function generateToken() {
-  return randomBytes(16).toString('hex');
+  return randomBytes(16).toString("hex");
 }
 
-// --- HTTP Pairing Endpoint ---
-server.on('request', (req, res) => {
-  if (req.method === 'POST' && req.url === '/pair') {
-    const pairId = generatePairId();
-    const token = generateToken();
+/**
+ * Log helper
+ */
+function log(context, message, data) {
+  console.log(`[${context}] ${message}`, data || "");
+}
 
-    // Create pair entry
-    const timeout = setTimeout(() => {
-      const entry = pairs.get(pairId);
-      if (!entry) return;
+/**
+ * Clean up a pair
+ */
+function cleanupPair(pairId) {
+  if (pairs.has(pairId)) {
+    log("CLEANUP", `Removing pair ${pairId}`);
+    pairs.delete(pairId);
+  }
+}
 
-      const { pc, app } = entry;
-      if (!pc || !app) {
-        console.log(`⏰ Expired unused pair: ${pairId}`);
-        if (pc && pc.readyState === WebSocket.OPEN) {
-          pc.send(JSON.stringify({ status: 'expired' }));
-        }
-        pairs.delete(pairId);
-      }
-    }, 2 * 60 * 1000); // 2 minutes
+// Handle WebSocket connections
+wss.on("connection", (ws, request, clientType, pairId, token, deviceName) => {
+  log("CONNECT", `${clientType} connected for pair ${pairId} (${deviceName})`);
 
-    pairs.set(pairId, {
-      token,
-      pc: null,
-      app: null,
-      deviceName: null,
-      timeout,
-    });
+  const pair = pairs.get(pairId);
 
-    console.log(`🔐 New Pair: ${pairId} [token: ${token.slice(0, 8)}...]`);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ pairId, token }));
+  if (!pair) {
+    ws.send(JSON.stringify({ type: "error", message: "Invalid pairId" }));
+    ws.close();
     return;
   }
 
-  res.writeHead(404);
-  res.end('Not Found');
+  // Attach the socket to the pair
+  pair[clientType] = ws;
+
+  // Notify successful connection
+  ws.send(
+    JSON.stringify({
+      type: "status",
+      message: `${clientType} registered successfully.`,
+    })
+  );
+
+  // If both are connected, notify them
+  if (pair.pc && pair.app) {
+    log("PAIR", `Both PC and App are connected for pair ${pairId}`);
+    pair.pc.send(
+      JSON.stringify({
+        type: "status",
+        message: "Mobile connected and ready.",
+      })
+    );
+    pair.app.send(
+      JSON.stringify({
+        type: "status",
+        message: "PC connected and ready.",
+      })
+    );
+  }
+
+  // Listen for messages
+  ws.on("message", (msg) => {
+    try {
+      const data = JSON.parse(msg);
+      log("MESSAGE", `${clientType} -> ${JSON.stringify(data)}`);
+
+      if (data.type === "clipboard") {
+        const target = clientType === "pc" ? pair.app : pair.pc;
+        if (target && target.readyState === WebSocket.OPEN) {
+          target.send(
+            JSON.stringify({
+              type: "clipboard",
+              from: deviceName,
+              content: data.content,
+            })
+          );
+          log(
+            "FORWARD",
+            `Clipboard sent from ${clientType} to ${
+              clientType === "pc" ? "app" : "pc"
+            }`
+          );
+        }
+      }
+    } catch (err) {
+      log("ERROR", `Invalid message from ${clientType}`, err);
+    }
+  });
+
+  // Handle disconnects
+  ws.on("close", () => {
+    log("DISCONNECT", `${clientType} disconnected from pair ${pairId}`);
+    cleanupPair(pairId);
+  });
 });
 
-// --- WebSocket Upgrade ---
-server.on('upgrade', (req, socket, head) => {
-  const { pathname } = url.parse(req.url);
-  if (pathname === '/') {
+// HTTP upgrade for WebSocket
+server.on("upgrade", (req, socket, head) => {
+  const { pathname, query } = url.parse(req.url, true);
+
+  if (pathname === "/pair") {
+    const pairId = generatePairId();
+    const token = generateToken();
+    pairs.set(pairId, { token, pc: null, app: null });
+
+    socket.write(
+      `HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n${JSON.stringify(
+        { pairId, token }
+      )}`
+    );
+    socket.destroy();
+  } else if (pathname === "/connect") {
+    const { pairId, token, type, deviceName } = query;
+
+    if (!pairs.has(pairId)) {
+      socket.destroy();
+      return;
+    }
+
+    const pair = pairs.get(pairId);
+    if (pair.token !== token) {
+      socket.destroy();
+      return;
+    }
+
     wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit('connection', ws, req);
+      wss.emit("connection", ws, req, type, pairId, token, deviceName);
     });
   } else {
     socket.destroy();
   }
 });
 
-wss.on('connection', (ws) => {
-  let pairId = null;
-  let role = null;
-  let verified = false;
-
-  console.log("🔗 New WebSocket connection");
-
-  ws.on('message', (msg) => {
-    try {
-      const data = JSON.parse(msg);
-
-      // Step 1: Authenticate
-      if (!verified && data.pairId && data.role && data.token) {
-        const entry = pairs.get(data.pairId);
-        console.log(`🔐 Incoming [${data.role}] for ${data.pairId}...`);
-
-        if (!entry) {
-          ws.send(JSON.stringify({ status: 'invalid_pair' }));
-          ws.close(1008, 'Invalid Pair ID');
-          return;
-        }
-
-        if (entry.token !== data.token) {
-          ws.send(JSON.stringify({ status: 'unauthorized' }));
-          ws.close(1008, 'Unauthorized Token');
-          return;
-        }
-
-        // Replace old connection if exists
-        if (entry[data.role]) {
-          try {
-            entry[data.role].close(4000, 'Replaced by new device');
-          } catch (err) {
-            console.warn(`⚠️ Failed to close old ${data.role}:`, err.message);
-          }
-        }
-
-        entry[data.role] = ws;
-        if (data.role === 'app' && data.deviceName) {
-          entry.deviceName = data.deviceName;
-        }
-
-        pairId = data.pairId;
-        role = data.role;
-        verified = true;
-
-        ws.send(JSON.stringify({ status: 'verified', role, pairId }));
-        console.log(`✅ ${role.toUpperCase()} verified for ${pairId}`);
-
-        // Cancel expiration if both roles are now connected
-        if (entry.pc && entry.app) {
-          clearTimeout(entry.timeout);
-          entry.timeout = null;
-        }
-
-        return;
-      }
-
-      // Step 2: Relay clipboard
-      if (verified && data.text && pairId) {
-        const entry = pairs.get(pairId);
-        if (!entry) return;
-
-        const target = role === 'pc' ? entry.app : entry.pc;
-        if (target && target.readyState === WebSocket.OPEN) {
-          target.send(
-            JSON.stringify({
-              text: data.text,
-              deviceName: entry.deviceName || 'Unknown Device',
-            })
-          );
-          console.log(`📤 Clipboard routed ${role} → ${role === 'pc' ? 'app' : 'pc'}`);
-        }
-      }
-
-    } catch (err) {
-      console.error("❌ Invalid JSON:", err.message);
-      ws.close(1008, 'Invalid JSON');
-    }
-  });
-
-  ws.on('close', (code, reason) => {
-    console.log(`🔌 Socket closed (code=${code}, reason="${reason}")`);
-
-    if (!pairId || !role) return;
-
-    const entry = pairs.get(pairId);
-    if (!entry) return;
-
-    if (entry[role] === ws) {
-      entry[role] = null;
-
-      const other = role === 'pc' ? entry.app : entry.pc;
-      if (other && other.readyState === WebSocket.OPEN) {
-        other.send(JSON.stringify({ status: `${role}_disconnected` }));
-      }
-
-      // Clean up if both are gone
-      if (!entry.pc && !entry.app) {
-        clearTimeout(entry.timeout);
-        pairs.delete(pairId);
-        console.log(`🗑️ Cleaned up pair: ${pairId}`);
-      } else {
-        console.log(`📴 ${role.toUpperCase()} disconnected from ${pairId}`);
-      }
-    }
-  });
-
-  ws.on('error', (err) => {
-    console.error("⚠️ WebSocket error:", err.message);
-  });
-});
-
+// Start the server
 server.listen(PORT, () => {
-  console.log(`✅ ClipSync Secure Server running on port ${PORT}`);
+  log("SERVER", `Running on port ${PORT}`);
 });
