@@ -1,3 +1,4 @@
+// server.js (improved logging + tolerant routing)
 const http = require("http");
 const WebSocket = require("ws");
 const { randomBytes } = require("crypto");
@@ -12,13 +13,12 @@ const pairs = new Map();
 function generatePairId() {
   return randomBytes(3).toString("hex");
 }
-
 function generateToken() {
   return randomBytes(16).toString("hex");
 }
 
 function log(context, message, data) {
-  console.log(`[${context}] ${message}`, data || "");
+  console.log(`[${new Date().toISOString()}] [${context}] ${message}`, data || "");
 }
 
 function cleanupPair(pairId) {
@@ -28,43 +28,74 @@ function cleanupPair(pairId) {
   }
 }
 
-// Normal HTTP endpoints
+// HTTP endpoints
 server.on("request", (req, res) => {
-  const parsed = url.parse(req.url, true);
+  try {
+    const parsed = url.parse(req.url, true);
 
-  if (req.method === "GET" && parsed.pathname === "/pair") {
-    const pairId = generatePairId();
-    const token = generateToken();
-    pairs.set(pairId, { token, pc: null, app: null });
+    // Normalize pathname (drop trailing slash)
+    const pathname = (parsed.pathname || "/").replace(/\/+$/, "") || "/";
 
-    log("PAIR", `Created pair ${pairId}`);
+    log("HTTP", `${req.method} ${req.url} -> normalized ${pathname}`);
 
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({ pairId, token }));
-  } else {
-    res.writeHead(404);
-    res.end();
+    if (req.method === "GET" && pathname === "/pair") {
+      const pairId = generatePairId();
+      const token = generateToken();
+      pairs.set(pairId, { token, pc: null, app: null });
+
+      log("PAIR", `Created pair ${pairId}`);
+
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*"
+      });
+      res.end(JSON.stringify({ pairId, token }));
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/health") {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (req.method === "GET" && pathname === "/") {
+      res.writeHead(200, { "Content-Type": "text/plain" });
+      res.end("ClipSync server running");
+      return;
+    }
+
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("Not found");
+  } catch (err) {
+    log("ERROR", "Request handler error", err && err.stack ? err.stack : err);
+    res.writeHead(500);
+    res.end("Server error");
   }
 });
 
-// WebSocket connections
+// WebSocket connection handling
 wss.on("connection", (ws, request, clientType, pairId, token, deviceName) => {
   log("CONNECT", `${clientType} connected for pair ${pairId} (${deviceName})`);
 
   const pair = pairs.get(pairId);
   if (!pair) {
-    ws.send(JSON.stringify({ type: "error", message: "Invalid pairId" }));
+    try { ws.send(JSON.stringify({ type: "error", message: "Invalid pairId" })); } catch {}
     ws.close();
     return;
   }
 
   pair[clientType] = ws;
 
-  ws.send(JSON.stringify({ type: "status", message: `${clientType} registered.` }));
+  try { ws.send(JSON.stringify({ type: "status", message: `${clientType} registered.` })); } catch {}
 
   if (pair.pc && pair.app) {
-    pair.pc.send(JSON.stringify({ type: "status", message: "Mobile connected" }));
-    pair.app.send(JSON.stringify({ type: "status", message: "PC connected" }));
+    try {
+      pair.pc.send(JSON.stringify({ type: "status", message: "Mobile connected" }));
+      pair.app.send(JSON.stringify({ type: "status", message: "PC connected" }));
+    } catch (e) {
+      log("ERROR", "Sending initial status failed", e);
+    }
   }
 
   ws.on("message", (msg) => {
@@ -86,25 +117,40 @@ wss.on("connection", (ws, request, clientType, pairId, token, deviceName) => {
   });
 
   ws.on("close", () => {
+    log("CLOSE", `WebSocket closed for ${clientType} ${pairId}`);
     cleanupPair(pairId);
   });
 });
 
 // Upgrade HTTP -> WebSocket
 server.on("upgrade", (req, socket, head) => {
-  const { pathname, query } = url.parse(req.url, true);
+  const parsed = url.parse(req.url, true);
+  const pathname = (parsed.pathname || "").replace(/\/+$/, "") || "";
+
+  log("UPGRADE", `Attempt upgrade: ${req.url} -> ${pathname}`);
 
   if (pathname === "/connect") {
-    const { pairId, token, type, deviceName } = query;
-    if (!pairs.has(pairId)) return socket.destroy();
+    const { pairId, token, type, deviceName } = parsed.query || {};
+    if (!pairId || !token) {
+      log("UPGRADE", "Missing pairId/token on upgrade", parsed.query);
+      return socket.destroy();
+    }
+    if (!pairs.has(pairId)) {
+      log("UPGRADE", `Unknown pairId ${pairId}`);
+      return socket.destroy();
+    }
 
     const pair = pairs.get(pairId);
-    if (pair.token !== token) return socket.destroy();
+    if (pair.token !== token) {
+      log("UPGRADE", `Invalid token for pair ${pairId}`);
+      return socket.destroy();
+    }
 
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req, type, pairId, token, deviceName);
     });
   } else {
+    log("UPGRADE", `Bad upgrade path: ${pathname}`);
     socket.destroy();
   }
 });
