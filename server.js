@@ -1,4 +1,4 @@
-// server.js (improved logging + tolerant routing)
+// server.js (improved logging + tolerant routing + disconnect notifications)
 const http = require("http");
 const WebSocket = require("ws");
 const { randomBytes } = require("crypto");
@@ -118,6 +118,20 @@ wss.on("connection", (ws, request, clientType, pairId, token, deviceName) => {
 
   ws.on("close", () => {
     log("CLOSE", `WebSocket closed for ${clientType} ${pairId}`);
+
+    const otherType = clientType === "pc" ? "app" : "pc";
+    const pairData = pairs.get(pairId);
+    if (pairData && pairData[otherType] && pairData[otherType].readyState === WebSocket.OPEN) {
+      try {
+        pairData[otherType].send(JSON.stringify({ 
+          type: "status", 
+          message: `${clientType === "pc" ? "PC" : "Mobile"} disconnected` 
+        }));
+      } catch (e) {
+        log("ERROR", "Failed to send disconnect message", e);
+      }
+    }
+
     cleanupPair(pairId);
   });
 });
