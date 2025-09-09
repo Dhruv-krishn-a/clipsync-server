@@ -1,411 +1,485 @@
 // server.js
+// ClipSync relay server — improved for 1 GiB transfers, robust pause/resume, and cleaner handling.
+
+"use strict";
+
 const http = require("http");
 const WebSocket = require("ws");
 const { randomBytes } = require("crypto");
 const url = require("url");
 
+// ---------------- Config ----------------
 const PORT = process.env.PORT || 5050;
-const server = http.createServer();
-const wss = new WebSocket.Server({ noServer: true });
+const CHUNK_SIZE = 64 * 1024; // 64 KiB (must match clients unless you negotiate)
+const MAX_FILE_SIZE = Number(process.env.MAX_FILE_SIZE || 1024 * 1024 * 1024); // 1 GiB
+const MAX_SIMULTANEOUS_FILES = Number(process.env.MAX_SIMULTANEOUS_FILES || 5);
+const CHUNK_RETRY_LIMIT = Number(process.env.CHUNK_RETRY_LIMIT || 3);
+const FILE_CLEANUP_TIMEOUT = Number(process.env.FILE_CLEANUP_TIMEOUT || 30 * 60 * 1000); // 30 min
+const PAIR_CLEANUP_TIMEOUT = Number(process.env.PAIR_CLEANUP_TIMEOUT || 12 * 60 * 60 * 1000); // 12h
+const HEARTBEAT_INTERVAL = Number(process.env.HEARTBEAT_INTERVAL || 30000); // 30s
 
-// Configuration
-const MAX_FILE_SIZE = 100 * 1024 * 1024; // 100MB max file size
-const MAX_SIMULTANEOUS_FILES = 5; // Max 5 files transferring at once per pair
-const CHUNK_RETRY_LIMIT = 3; // Max retries for failed chunks
-const FILE_CLEANUP_TIMEOUT = 10 * 60 * 1000; // 10 minutes
-
-// Store pairs with structure { token, pc: ws, app: ws, clipboardHistory: [], files: {} }
+// ---------------- State ----------------
+/**
+ * pairs map:
+ * pairId -> {
+ *   token,
+ *   pc: ws | null,
+ *   app: ws | null,
+ *   clipboardHistory: Array<{from, content, timestamp}>,
+ *   files: {
+ *     [fileId]: {
+ *       fileId, name, totalChunks, totalSize?: number,
+ *       receivedChunks: number,
+ *       receivedMap: Set<number>, // which chunk indices have been relayed
+ *       status: 'sending' | 'paused' | 'completed',
+ *       senderType: 'pc' | 'app',
+ *       createdAt: number,
+ *       lastActivity: number
+ *     }
+ *   },
+ *   createdAt: number,
+ *   lastActivity: number
+ * }
+ */
 const pairs = new Map();
 
+// ---------------- Utilities ----------------
+function log(ctx, msg, data) {
+  if (data !== undefined) {
+    console.log(`[${new Date().toISOString()}] [${ctx}] ${msg}`, data);
+  } else {
+    console.log(`[${new Date().toISOString()}] [${ctx}] ${msg}`);
+  }
+}
 function generatePairId() {
   return randomBytes(3).toString("hex");
 }
-
 function generateToken() {
   return randomBytes(16).toString("hex");
 }
-
-function log(context, message, data) {
-  console.log(`[${new Date().toISOString()}] [${context}] ${message}`, data || "");
+function getOtherType(t) {
+  return t === "pc" ? "app" : "pc";
 }
 
 function cleanupPair(pairId) {
-  if (pairs.has(pairId)) {
-    log("CLEANUP", `Removing pair ${pairId}`);
-    pairs.delete(pairId);
-  }
+  const p = pairs.get(pairId);
+  if (!p) return;
+  if (p.pc) try { p.pc.close(); } catch {}
+  if (p.app) try { p.app.close(); } catch {}
+  pairs.delete(pairId);
+  log("CLEANUP", `Removed pair ${pairId}`);
 }
 
-function validateFileSize(totalChunks) {
-  const estimatedSize = totalChunks * 64 * 1024; // 64KB per chunk
-  return estimatedSize <= MAX_FILE_SIZE;
+function validateFileBudget({ totalChunks, declaredSize }) {
+  // Prefer explicit size if the sender provides it, otherwise estimate.
+  const estimated = totalChunks * CHUNK_SIZE;
+  const size = Number.isFinite(declaredSize) ? declaredSize : estimated;
+
+  return size <= MAX_FILE_SIZE;
 }
 
-// ---------------- HTTP ----------------
-server.on("request", (req, res) => {
+// ---------------- HTTP server ----------------
+const server = http.createServer((req, res) => {
   try {
     const parsed = url.parse(req.url, true);
     const pathname = (parsed.pathname || "/").replace(/\/+$/, "") || "/";
 
-    log("HTTP", `${req.method} ${req.url} -> normalized ${pathname}`);
-
     if (req.method === "GET" && pathname === "/pair") {
       const pairId = generatePairId();
       const token = generateToken();
-      pairs.set(pairId, { 
-        token, 
-        pc: null, 
-        app: null, 
+      pairs.set(pairId, {
+        token,
+        pc: null,
+        app: null,
         clipboardHistory: [],
-        files: {} 
+        files: {},
+        createdAt: Date.now(),
+        lastActivity: Date.now()
       });
 
-      res.writeHead(200, { "Content-Type": "application/json", "Access-Control-Allow-Origin": "*" });
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store"
+      });
       res.end(JSON.stringify({ pairId, token }));
       return;
     }
 
     if (req.method === "GET" && pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true }));
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, uptime: process.uptime() }));
       return;
     }
 
     if (req.method === "GET" && pathname === "/") {
       res.writeHead(200, { "Content-Type": "text/plain" });
-      res.end("ClipSync server running");
+      res.end("ClipSync relay running");
       return;
     }
 
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("Not found");
   } catch (err) {
-    log("ERROR", "Request handler error", err);
-    res.writeHead(500);
+    log("ERROR", "HTTP request handler error", err);
+    res.writeHead(500, { "Content-Type": "text/plain" });
     res.end("Server error");
   }
 });
 
-// ---------------- WebSocket ----------------
+// ---------------- WebSocket server ----------------
+const wss = new WebSocket.Server({ noServer: true });
+
+// Attach connection with extra metadata
 wss.on("connection", (ws, req, clientType, pairId, token, deviceName) => {
-  log("CONNECT", `${clientType} connected for pair ${pairId} (${deviceName})`);
+  ws.isAlive = true; // heartbeat
+  ws.deviceName = deviceName || "Unknown";
+  ws.clientType = clientType;
+  ws.pairId = pairId;
 
   const pair = pairs.get(pairId);
   if (!pair || pair.token !== token) {
-    ws.send(JSON.stringify({ type: "error", message: "Invalid pair or token" }));
+    try { ws.send(JSON.stringify({ type: "error", message: "Invalid pair or token" })); } catch {}
     return ws.close();
   }
 
-  pair[clientType] = ws;
-
-  try { 
-    ws.send(JSON.stringify({ type: "status", message: `${clientType} registered.` })); 
-    
-    // Send clipboard history to newly connected client
-    if (pair.clipboardHistory.length > 0) {
-      pair.clipboardHistory.forEach(item => {
-        ws.send(JSON.stringify({ 
-          type: "clipboard", 
-          from: item.from, 
-          content: item.content 
-        }));
-      });
+  // Keep only one socket per side
+  try {
+    if (pair[clientType] && pair[clientType] !== ws) {
+      try { pair[clientType].close(); } catch {}
     }
+  } catch {}
 
-    // Send file status for incomplete files
-    Object.entries(pair.files).forEach(([fileId, file]) => {
-      if (file.status !== 'completed') {
-        // Notify about existing files
-        if (clientType !== file.senderType) {
-          ws.send(JSON.stringify({
-            type: "file_meta",
-            fileId: file.fileId,
-            fileName: file.name,
-            totalChunks: file.totalChunks
-          }));
-        }
+  pair[clientType] = ws;
+  pair.lastActivity = Date.now();
 
-        // Send progress for files sent by this client
-        if (clientType === file.senderType && file.receivedChunks > 0) {
-          ws.send(JSON.stringify({
-            type: "file_progress",
-            fileId: file.fileId,
-            receivedChunks: file.receivedChunks,
-            totalChunks: file.totalChunks
-          }));
-        }
-      }
-    });
-  } catch (e) { log("ERROR", "Initial status failed", e); }
+  log("CONNECT", `${clientType} connected for pair ${pairId} (${ws.deviceName})`);
 
-  // Notify both sides if connected
-  if (pair.pc && pair.app) {
-    try {
-      pair.pc.send(JSON.stringify({ type: "status", message: "Mobile connected" }));
-      pair.app.send(JSON.stringify({ type: "status", message: "PC connected" }));
-    } catch (e) { log("ERROR", "Initial status failed", e); }
+  // Initial status + warm state
+  const safeSend = (sock, obj) => {
+    if (!sock || sock.readyState !== WebSocket.OPEN) return;
+    try { sock.send(JSON.stringify(obj)); } catch (e) { log("ERROR", "send fail", e); }
+  };
+
+  safeSend(ws, { type: "status", message: `${clientType} registered.` });
+
+  // Send clipboard history to the just-connected client
+  if (pair.clipboardHistory.length > 0) {
+    for (const item of pair.clipboardHistory) {
+      safeSend(ws, { type: "clipboard", from: item.from, content: item.content });
+    }
   }
 
-  // ---------------- Messages ----------------
-  ws.on("message", (msg) => {
-    try {
-      const data = JSON.parse(msg);
-
-      // Clipboard
-      if (data.type === "clipboard") {
-        // Add to history
-        pair.clipboardHistory.push({
-          from: deviceName,
-          content: data.content,
-          timestamp: Date.now()
+  // Send file status to sync state
+  for (const f of Object.values(pair.files)) {
+    if (f.status !== "completed") {
+      // Inform receiver about incoming file
+      if (clientType !== f.senderType) {
+        safeSend(ws, {
+          type: "file_meta",
+          fileId: f.fileId,
+          fileName: f.name,
+          totalChunks: f.totalChunks
         });
-        
-        // Keep only the last 50 items
-        if (pair.clipboardHistory.length > 50) {
-          pair.clipboardHistory = pair.clipboardHistory.slice(-50);
-        }
-        
-        const target = clientType === "pc" ? pair.app : pair.pc;
-        if (target?.readyState === WebSocket.OPEN) {
-          target.send(JSON.stringify({ 
-            type: "clipboard", 
-            from: deviceName, 
-            content: data.content 
-          }));
-        }
+      }
+      // Inform sender about progress
+      if (clientType === f.senderType && f.receivedChunks > 0) {
+        safeSend(ws, {
+          type: "file_progress",
+          fileId: f.fileId,
+          receivedChunks: f.receivedChunks,
+          totalChunks: f.totalChunks
+        });
+      }
+    }
+  }
+
+  // Notify both sides if fully paired
+  if (pair.pc && pair.app) {
+    safeSend(pair.pc, { type: "status", message: "Mobile connected" });
+    safeSend(pair.app, { type: "status", message: "PC connected" });
+  }
+
+  // Heartbeat for this socket
+  ws.on("pong", () => { ws.isAlive = true; });
+
+  // --------------- Message handling ---------------
+  ws.on("message", (raw) => {
+    let data;
+    try {
+      data = JSON.parse(raw);
+    } catch (err) {
+      log("ERROR", "Invalid JSON message", err);
+      return;
+    }
+
+    const now = Date.now();
+    pair.lastActivity = now;
+
+    const sendToOther = (obj) => {
+      const other = pair[getOtherType(clientType)];
+      if (other && other.readyState === WebSocket.OPEN) {
+        try { other.send(JSON.stringify(obj)); } catch (e) { log("ERROR", "forward fail", e); }
+      }
+    };
+
+    // ---- Clipboard ----
+    if (data.type === "clipboard") {
+      pair.clipboardHistory.push({
+        from: ws.deviceName,
+        content: data.content || "",
+        timestamp: now
+      });
+      if (pair.clipboardHistory.length > 50) {
+        pair.clipboardHistory = pair.clipboardHistory.slice(-50);
+      }
+      sendToOther({ type: "clipboard", from: ws.deviceName, content: data.content || "" });
+      return;
+    }
+
+    // ---- File metadata ----
+    if (data.type === "file_meta") {
+      const { fileId, fileName, totalChunks, totalSize } = data || {};
+      // Limits
+      const active = Object.values(pair.files).filter(
+        (f) => f.status === "sending" || f.status === "paused"
+      ).length;
+
+      if (active >= MAX_SIMULTANEOUS_FILES) {
+        return safeSend(ws, {
+          type: "error",
+          message: `Too many simultaneous file transfers. Maximum is ${MAX_SIMULTANEOUS_FILES}`
+        });
       }
 
-      // File meta
-      if (data.type === "file_meta") {
-        // Check file size limit
-        if (!validateFileSize(data.totalChunks)) {
-          ws.send(JSON.stringify({ 
-            type: "error", 
-            message: `File too large. Maximum size is ${MAX_FILE_SIZE / 1024 / 1024}MB` 
-          }));
-          return;
-        }
-
-        // Check simultaneous files limit
-        const activeFiles = Object.values(pair.files).filter(f => 
-          f.status === 'sending' || f.status === 'receiving'
-        ).length;
-        
-        if (activeFiles >= MAX_SIMULTANEOUS_FILES) {
-          ws.send(JSON.stringify({ 
-            type: "error", 
-            message: `Too many simultaneous file transfers. Maximum is ${MAX_SIMULTANEOUS_FILES}` 
-          }));
-          return;
-        }
-
-        pair.files[data.fileId] = {
-          fileId: data.fileId,
-          name: data.fileName,
-          totalChunks: data.totalChunks,
-          receivedChunks: 0,
-          chunks: {}, // Track received chunks for resuming
-          status: 'sending',
-          senderType: clientType,
-          createdAt: Date.now()
-        };
-        
-        const target = clientType === "pc" ? pair.app : pair.pc;
-        if (target?.readyState === WebSocket.OPEN) {
-          target.send(JSON.stringify({
-            type: "file_meta",
-            fileId: data.fileId,
-            fileName: data.fileName,
-            totalChunks: data.totalChunks
-          }));
-        }
+      if (!Number.isInteger(totalChunks) || totalChunks <= 0 || !fileId || !fileName) {
+        return safeSend(ws, { type: "error", message: "Invalid file meta" });
       }
 
-      // File chunk
-      if (data.type === "file_chunk") {
-        const file = pair.files[data.fileId];
-        if (!file) return;
+      if (!validateFileBudget({ totalChunks, declaredSize: totalSize })) {
+        return safeSend(ws, {
+          type: "error",
+          message: `File too large. Maximum size is ${Math.floor(MAX_FILE_SIZE / (1024 * 1024))}MB`
+        });
+      }
 
-        // Skip if file is paused
-        if (file.status === 'paused') return;
+      pair.files[fileId] = {
+        fileId,
+        name: fileName,
+        totalChunks,
+        totalSize: typeof totalSize === "number" ? totalSize : undefined,
+        receivedChunks: 0,
+        receivedMap: new Set(),
+        status: "sending",
+        senderType: clientType,
+        createdAt: now,
+        lastActivity: now
+      };
 
+      // forward meta to receiver
+      sendToOther({ type: "file_meta", fileId, fileName, totalChunks });
+      return;
+    }
+
+    // ---- File chunk ----
+    if (data.type === "file_chunk") {
+      const { fileId, chunkIndex, data: base64 } = data || {};
+      const file = pair.files[fileId];
+      if (!file) return;
+      if (file.status === "paused") return;
+
+      // Mark received only once per index
+      if (!file.receivedMap.has(chunkIndex)) {
+        file.receivedMap.add(chunkIndex);
         file.receivedChunks += 1;
-        file.chunks[data.chunkIndex] = true; // Mark this chunk as received
-
-        const target = clientType === "pc" ? pair.app : pair.pc;
-        if (target?.readyState === WebSocket.OPEN) {
-          // Try to send with retry logic
-          let retries = 0;
-          const sendChunk = () => {
-            try {
-              target.send(JSON.stringify({
-                type: "file_chunk",
-                fileId: data.fileId,
-                chunkIndex: data.chunkIndex,
-                totalChunks: file.totalChunks,
-                data: data.data
-              }));
-            } catch (err) {
-              if (retries < CHUNK_RETRY_LIMIT) {
-                retries++;
-                setTimeout(sendChunk, 100 * retries); // Exponential backoff
-              } else {
-                log("ERROR", `Failed to send chunk ${data.chunkIndex} for file ${data.fileId} after ${retries} retries`, err);
-                // Pause the file transfer on persistent failure
-                file.status = 'paused';
-                ws.send(JSON.stringify({
-                  type: "file_paused",
-                  fileId: data.fileId,
-                  reason: "Failed to send chunk after multiple retries"
-                }));
-              }
-            }
-          };
-          
-          sendChunk();
-        }
+        file.lastActivity = now;
       }
 
-      // File complete
-      if (data.type === "file_complete") {
-        const file = pair.files[data.fileId];
-        if (!file) return;
-
-        file.status = 'completed';
-        const target = clientType === "pc" ? pair.app : pair.pc;
-        if (target?.readyState === WebSocket.OPEN) {
-          target.send(JSON.stringify({ 
-            type: "file_complete", 
-            fileId: data.fileId 
-          }));
-        }
-        
-        // Clean up file data after a while
-        setTimeout(() => {
-          delete pair.files[data.fileId];
-        }, FILE_CLEANUP_TIMEOUT);
+      const target = pair[getOtherType(clientType)];
+      if (!target || target.readyState !== WebSocket.OPEN) {
+        // Receiver not available -> pause and notify both
+        file.status = "paused";
+        safeSend(ws, { type: "file_paused", fileId, reason: "Receiver unavailable" });
+        sendToOther({ type: "file_paused", fileId, reason: "Receiver unavailable" });
+        return;
       }
 
-      // Pause file transfer
-      if (data.type === "pause_file") {
-        const file = pair.files[data.fileId];
-        if (file) {
-          file.status = 'paused';
-          log("FILE", `Paused file transfer: ${data.fileId}`);
-          
-          // Notify the receiver
-          const target = clientType === "pc" ? pair.app : pair.pc;
-          if (target?.readyState === WebSocket.OPEN) {
-            target.send(JSON.stringify({
-              type: "file_paused",
-              fileId: data.fileId
-            }));
+      // Try forwarding with basic retry
+      let retries = 0;
+      const payload = {
+        type: "file_chunk",
+        fileId,
+        chunkIndex,
+        totalChunks: file.totalChunks,
+        data: base64 // still JSON+base64 for compatibility
+      };
+
+      const attempt = () => {
+        try {
+          target.send(JSON.stringify(payload));
+        } catch (err) {
+          if (retries < CHUNK_RETRY_LIMIT) {
+            retries++;
+            setTimeout(attempt, 100 * retries);
+          } else {
+            log("ERROR", `Failed to relay chunk ${chunkIndex} for file ${fileId} after ${retries} retries`, err);
+            file.status = "paused";
+            safeSend(ws, { type: "file_paused", fileId, reason: "Relay failed" });
+            sendToOther({ type: "file_paused", fileId, reason: "Relay failed" });
           }
         }
+      };
+      attempt();
+
+      return;
+    }
+
+    // ---- File complete ----
+    if (data.type === "file_complete") {
+      const { fileId } = data || {};
+      const file = pair.files[fileId];
+      if (!file) return;
+
+      file.status = "completed";
+      file.lastActivity = now;
+
+      sendToOther({ type: "file_complete", fileId });
+
+      // Cleanup file entry later
+      setTimeout(() => {
+        if (pair.files[fileId]?.status === "completed") {
+          delete pair.files[fileId];
+          log("CLEANUP", `Removed completed file ${fileId}`);
+        }
+      }, FILE_CLEANUP_TIMEOUT);
+
+      return;
+    }
+
+    // ---- Pause file ----
+    if (data.type === "pause_file") {
+      const { fileId } = data || {};
+      const file = pair.files[fileId];
+      if (!file) return;
+      file.status = "paused";
+      file.lastActivity = now;
+
+      safeSend(ws, { type: "file_paused", fileId });
+      sendToOther({ type: "file_paused", fileId });
+      return;
+    }
+
+    // ---- Resume file ----
+    if (data.type === "resume_file") {
+      const { fileId } = data || {};
+      const file = pair.files[fileId];
+      if (!file || file.status === "completed") return;
+
+      file.status = "sending";
+      file.lastActivity = now;
+
+      // Notify both sides
+      safeSend(ws, { type: "file_resumed", fileId });
+      sendToOther({ type: "file_resumed", fileId });
+
+      // Compute missing and ask the *sender* to resend them (no matter who resumed)
+      const missing = [];
+      for (let i = 0; i < file.totalChunks; i++) {
+        if (!file.receivedMap.has(i)) missing.push(i);
       }
-
-      // Resume file transfer
-      if (data.type === "resume_file") {
-        const file = pair.files[data.fileId];
-        if (file && file.status === 'paused') {
-          file.status = 'sending';
-          log("FILE", `Resumed file transfer: ${data.fileId}`);
-          
-          // Notify the receiver
-          const target = clientType === "pc" ? pair.app : pair.pc;
-          if (target?.readyState === WebSocket.OPEN) {
-            target.send(JSON.stringify({
-              type: "file_resumed",
-              fileId: data.fileId
-            }));
-          }
-
-          // If this is the sender resuming, we might need to resend missing chunks
-          if (clientType === file.senderType) {
-            // Find missing chunks and request them
-            const missingChunks = [];
-            for (let i = 0; i < file.totalChunks; i++) {
-              if (!file.chunks[i]) {
-                missingChunks.push(i);
-              }
-            }
-            
-            if (missingChunks.length > 0) {
-              ws.send(JSON.stringify({
-                type: "file_missing_chunks",
-                fileId: data.fileId,
-                chunks: missingChunks
-              }));
-            }
-          }
+      const senderWs = pair[file.senderType];
+      if (senderWs && senderWs.readyState === WebSocket.OPEN && missing.length) {
+        try {
+          senderWs.send(JSON.stringify({ type: "file_missing_chunks", fileId, chunks: missing }));
+        } catch (e) {
+          log("ERROR", "Failed to request missing chunks from sender", e);
         }
       }
+      return;
+    }
 
-      // Request specific chunks (for resuming)
-      if (data.type === "request_chunks") {
-        const file = pair.files[data.fileId];
-        if (file && clientType === file.senderType) {
-          // The sender should respond by sending the requested chunks
-          ws.send(JSON.stringify({
-            type: "resend_chunks",
-            fileId: data.fileId,
-            chunks: data.chunks
-          }));
+    // ---- Request specific chunks (from receiver) ----
+    // If a client explicitly asks for some chunks, ensure the request reaches the sender.
+    if (data.type === "request_chunks") {
+      const { fileId, chunks } = data || {};
+      const file = pair.files[fileId];
+      if (!file) return;
+      const senderWs = pair[file.senderType];
+      if (senderWs && senderWs.readyState === WebSocket.OPEN && Array.isArray(chunks) && chunks.length) {
+        try {
+          senderWs.send(JSON.stringify({ type: "file_missing_chunks", fileId, chunks }));
+        } catch (e) {
+          log("ERROR", "Failed to forward chunk request to sender", e);
         }
       }
-
-    } catch (err) { 
-      log("ERROR", "Invalid message", err); 
+      return;
     }
   });
 
   ws.on("close", () => {
+    const p = pairs.get(pairId);
+    if (!p) return;
+
     log("CLOSE", `${clientType} disconnected from ${pairId}`);
-
-    const otherType = clientType === "pc" ? "app" : "pc";
-    const other = pair[otherType];
-    if (other?.readyState === WebSocket.OPEN) {
-      other.send(JSON.stringify({ 
-        type: "status", 
-        message: `${clientType} disconnected` 
-      }));
+    const otherType = getOtherType(clientType);
+    const other = p[otherType];
+    if (other && other.readyState === WebSocket.OPEN) {
+      try { other.send(JSON.stringify({ type: "status", message: `${clientType} disconnected` })); } catch {}
     }
 
-    // Pause all files from this client
-    Object.values(pair.files).forEach(file => {
-      if (file.senderType === clientType && file.status === 'sending') {
-        file.status = 'paused';
-        log("FILE", `Auto-paused file ${file.fileId} due to sender disconnect`);
+    // Pause all active files where this client is the sender
+    for (const f of Object.values(p.files)) {
+      if (f.senderType === clientType && f.status === "sending") {
+        f.status = "paused";
+        try { other?.send(JSON.stringify({ type: "file_paused", fileId: f.fileId, reason: "Sender disconnected" })); } catch {}
       }
-    });
+    }
 
-    // Only cleanup if both clients are disconnected
-    if (!pair.pc && !pair.app) {
+    p[clientType] = null;
+
+    // Cleanup pair if nobody is connected
+    if (!p.pc && !p.app) {
       cleanupPair(pairId);
-    } else {
-      pair[clientType] = null;
     }
   });
 
-  // Set up periodic cleanup for stale files
-  const cleanupInterval = setInterval(() => {
-    const now = Date.now();
-    Object.entries(pair.files).forEach(([fileId, file]) => {
-      // Clean up files that have been inactive for too long
-      if (now - file.createdAt > FILE_CLEANUP_TIMEOUT && file.status !== 'completed') {
-        log("CLEANUP", `Removing stale file: ${fileId}`);
-        delete pair.files[fileId];
-      }
-    });
-  }, 60000); // Check every minute
+  // Periodic stale files cleanup for this connection's pair
+  const staleTimer = setInterval(() => {
+    const p = pairs.get(pairId);
+    if (!p) return;
 
-  // Clear interval when connection closes
-  ws.on('close', () => {
-    clearInterval(cleanupInterval);
-  });
+    const now = Date.now();
+    for (const [fid, f] of Object.entries(p.files)) {
+      if (now - f.lastActivity > FILE_CLEANUP_TIMEOUT && f.status !== "completed") {
+        log("CLEANUP", `Removing stale incomplete file: ${fid}`);
+        delete p.files[fid];
+      }
+    }
+
+    // Pair-level idle cleanup
+    if (!p.pc && !p.app && now - p.lastActivity > PAIR_CLEANUP_TIMEOUT) {
+      cleanupPair(pairId);
+    }
+  }, 60000);
+
+  ws.on("close", () => clearInterval(staleTimer));
 });
 
-// ---------------- HTTP -> WS Upgrade ----------------
+// Global heartbeat to drop dead sockets
+const heartbeat = setInterval(() => {
+  wss.clients.forEach((ws) => {
+    if (ws.isAlive === false) {
+      try { ws.terminate(); } catch {}
+      return;
+    }
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  });
+}, HEARTBEAT_INTERVAL);
+
+wss.on("close", () => clearInterval(heartbeat));
+
+// ---------------- HTTP -> WS upgrade ----------------
 server.on("upgrade", (req, socket, head) => {
   const parsed = url.parse(req.url, true);
   const pathname = (parsed.pathname || "").replace(/\/+$/, "") || "";
@@ -413,9 +487,12 @@ server.on("upgrade", (req, socket, head) => {
   if (pathname === "/connect") {
     const { pairId, token, type, deviceName } = parsed.query || {};
     if (!pairId || !token || !type) return socket.destroy();
-    if (!pairs.has(pairId) || pairs.get(pairId).token !== token) return socket.destroy();
+    const p = pairs.get(pairId);
+    if (!p || p.token !== token) return socket.destroy();
 
-    wss.handleUpgrade(req, socket, head, ws => {
+    if (type !== "pc" && type !== "app") return socket.destroy();
+
+    wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req, type, pairId, token, deviceName || "Unknown");
     });
   } else {
